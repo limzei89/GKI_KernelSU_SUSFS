@@ -183,7 +183,7 @@ jobs:
           [[ -n "$EXTRACTED" ]] && ACTUAL_SUBLEVEL="$EXTRACTED"
         fi
 
-        ARTIFACT_BASE="${{ inputs.kernel_version }}.$ACTUAL_SUBLEVEL-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-EarlyCapture-Gen2"
+        ARTIFACT_BASE="${{ inputs.kernel_version }}.$ACTUAL_SUBLEVEL-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-EarlyCapture-Gen2-DXEv2"
         echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
         echo "ARTIFACT_BASE=$ARTIFACT_BASE" >> $GITHUB_ENV
         echo "FILE_NAME=$ARTIFACT_BASE" >> $GITHUB_ENV
@@ -490,7 +490,7 @@ jobs:
         #define ABL_CAPTURE_SIZE 0xb78
         #define ABL_CAPTURE_MAX 16
         #define ABL_CAPTURE_START ((phys_addr_t)0x9fd00000ULL)
-        #define ABL_CAPTURE_END ((phys_addr_t)0xe0000000ULL)
+        #define ABL_CAPTURE_END ((phys_addr_t)0xffc00000ULL)
         
         struct abl_capture_record {
         	phys_addr_t address;
@@ -595,8 +595,11 @@ jobs:
         {
         	unsigned int r, i;
         	seq_puts(m, "ABL_CAPTURE v1; candidates only, not authenticated rollback values\n");
-        	seq_printf(m, "ran=%u window=0xa2400000-0xd39fffff page_size=%lu\n",
-        		abl_capture_ran, (unsigned long)PAGE_SIZE);
+        	seq_puts(m, "profile=TB320FC-1.1.350-DXE-v2\n");
+        	seq_printf(m, "ran=%u window=0x%llx-0x%llx page_size=%lu\n",
+        		abl_capture_ran, (unsigned long long)ABL_CAPTURE_START,
+        		(unsigned long long)(ABL_CAPTURE_END - 1),
+        		(unsigned long)PAGE_SIZE);
         	seq_printf(m, "read_pages=%lu fault_pages=%lu kernel_pages_skipped=%lu\n",
         		abl_pages_read, abl_pages_failed, abl_pages_skipped);
         	seq_printf(m, "magic_hits=%lu snapshot_failures=%lu saved=%u limit=%u\n",
@@ -806,6 +809,8 @@ jobs:
                 raise SystemExit(1)
         ABL_VERIFY_PY
         python3 /tmp/verify_gen2_kernel.py "$ANYKERNEL3/Image" "$GITHUB_WORKSPACE/devmem-final.config"
+
+        grep -aFq 'TB320FC-1.1.350-DXE-v2' "$ANYKERNEL3/Image"
 
     - name: Upload early capture source
       uses: actions/upload-artifact@v4
