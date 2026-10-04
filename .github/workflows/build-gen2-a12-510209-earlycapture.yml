@@ -733,9 +733,11 @@ jobs:
         function abl_update_config() {
             "${ROOT_DIR}/${KERNEL_DIR}/scripts/config" --file "${OUT_DIR}/.config" \
                 -e DEVMEM -d STRICT_DEVMEM -d IO_STRICT_DEVMEM \
-                -e IKCONFIG -e IKCONFIG_PROC -e KSU
+                -e IKCONFIG -e IKCONFIG_PROC -e KSU -d KSU_SUSFS -e KPROBES
             (cd "${OUT_DIR}" && make ${CC_LD_ARG} O="${OUT_DIR}" olddefconfig)
             grep -qx 'CONFIG_KSU=y' "${OUT_DIR}/.config"
+            grep -qx '# CONFIG_KSU_SUSFS is not set' "${OUT_DIR}/.config"
+            grep -qx 'CONFIG_KPROBES=y' "${OUT_DIR}/.config"
             grep -qx 'CONFIG_DEVMEM=y' "${OUT_DIR}/.config"
             grep -qx '# CONFIG_STRICT_DEVMEM is not set' "${OUT_DIR}/.config"
             echo "PASS: diagnostic settings applied after defconfig"
