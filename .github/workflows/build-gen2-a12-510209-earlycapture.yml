@@ -1,4 +1,4 @@
-name: Build Gen2 A12 5.10.209 EARLYCAPTURE
+name: Build Gen2 A12 5.10.209 EARLYCAPTURE KSU
 permissions:
   contents: write
   actions: write
@@ -183,7 +183,7 @@ jobs:
           [[ -n "$EXTRACTED" ]] && ACTUAL_SUBLEVEL="$EXTRACTED"
         fi
 
-        ARTIFACT_BASE="${{ inputs.kernel_version }}.$ACTUAL_SUBLEVEL-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-EarlyCapture-Gen2-DXEv2"
+        ARTIFACT_BASE="${{ inputs.kernel_version }}.$ACTUAL_SUBLEVEL-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-EarlyCapture-Gen2-DXEv2-KSU"
         echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
         echo "ARTIFACT_BASE=$ARTIFACT_BASE" >> $GITHUB_ENV
         echo "FILE_NAME=$ARTIFACT_BASE" >> $GITHUB_ENV
@@ -217,6 +217,17 @@ jobs:
         if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c; then
             sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace\/hooks\/fs.h>' ./fs/namespace.c
         fi
+
+    - name: Add WKSU
+      working-directory: ${{ env.KERNEL_ROOT }}
+      env:
+        KSU_REF: ${{ inputs.ksu_commit || 'canary' }}
+      run: |
+        set -euo pipefail
+        curl -fLSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" -o /tmp/wild-ksu-setup.sh
+        bash /tmp/wild-ksu-setup.sh "$KSU_REF"
+        test -f common/drivers/kernelsu/Kconfig
+        git -C Wild_KSU rev-parse HEAD | tee "$GITHUB_WORKSPACE/kernelsu-commit.txt"
 
     - name: Add BBG
       if: false
@@ -288,7 +299,7 @@ jobs:
         CONFIG_IKCONFIG=y
         CONFIG_IKCONFIG_PROC=y
         # KernelSU Configuration
-        # CONFIG_KSU is not set
+        CONFIG_KSU=y
         # CONFIG_KSU_SUSFS is not set
 
         # KPatch Next Support
@@ -722,8 +733,9 @@ jobs:
         function abl_update_config() {
             "${ROOT_DIR}/${KERNEL_DIR}/scripts/config" --file "${OUT_DIR}/.config" \
                 -e DEVMEM -d STRICT_DEVMEM -d IO_STRICT_DEVMEM \
-                -e IKCONFIG -e IKCONFIG_PROC
+                -e IKCONFIG -e IKCONFIG_PROC -e KSU
             (cd "${OUT_DIR}" && make ${CC_LD_ARG} O="${OUT_DIR}" olddefconfig)
+            grep -qx 'CONFIG_KSU=y' "${OUT_DIR}/.config"
             grep -qx 'CONFIG_DEVMEM=y' "${OUT_DIR}/.config"
             grep -qx '# CONFIG_STRICT_DEVMEM is not set' "${OUT_DIR}/.config"
             echo "PASS: diagnostic settings applied after defconfig"
@@ -760,7 +772,7 @@ jobs:
         import zlib
         
         
-        def verify_image(image):
+        def verify_image(image, require_ksu=False):
             configs = []
             start = 0
             while True:
@@ -786,9 +798,12 @@ jobs:
             lines = set(config.splitlines())
             required = ['CONFIG_DEVMEM=y', 'CONFIG_IKCONFIG=y', 'CONFIG_IKCONFIG_PROC=y',
                         '# CONFIG_STRICT_DEVMEM is not set']
+            if require_ksu:
+                required.append('CONFIG_KSU=y')
             errors = [f'Missing required setting: {x}' for x in required if x not in lines]
             errors += [f'Unexpected setting: {x}' for x in
-                       ['CONFIG_KSU=y', 'CONFIG_KSU_SUSFS=y', 'CONFIG_IO_STRICT_DEVMEM=y'] if x in lines]
+                       (['CONFIG_KSU_SUSFS=y', 'CONFIG_IO_STRICT_DEVMEM=y'] +
+                        ([] if require_ksu else ['CONFIG_KSU=y'])) if x in lines]
             if b'ABL_CAPTURE v1' not in image:
                 errors.append('EarlyCapture marker is missing from Image')
             if errors:
@@ -798,17 +813,17 @@ jobs:
         
         if __name__ == '__main__':
             try:
-                config = verify_image(pathlib.Path(sys.argv[1]).read_bytes())
+                config = verify_image(pathlib.Path(sys.argv[1]).read_bytes(), require_ksu='--kernelsu' in sys.argv[3:])
                 pathlib.Path(sys.argv[2]).write_text(config, encoding='utf-8')
                 print('PASS: embedded config and EarlyCapture marker verified')
                 for line in config.splitlines():
-                    if any(x in line for x in ['CONFIG_DEVMEM', 'CONFIG_STRICT_DEVMEM', 'CONFIG_IO_STRICT_DEVMEM']):
+                    if any(x in line for x in ['CONFIG_DEVMEM', 'CONFIG_STRICT_DEVMEM', 'CONFIG_IO_STRICT_DEVMEM', 'CONFIG_KSU']):
                         print(line)
             except (OSError, ValueError) as error:
                 print('VERIFICATION FAILED:', error, file=sys.stderr)
                 raise SystemExit(1)
         ABL_VERIFY_PY
-        python3 /tmp/verify_gen2_kernel.py "$ANYKERNEL3/Image" "$GITHUB_WORKSPACE/devmem-final.config"
+        python3 /tmp/verify_gen2_kernel.py "$ANYKERNEL3/Image" "$GITHUB_WORKSPACE/devmem-final.config" --kernelsu
 
         grep -aFq 'TB320FC-1.1.350-DXE-v2' "$ANYKERNEL3/Image"
 
@@ -824,7 +839,9 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: devmem-config-${{ matrix.build_type }}
-        path: devmem-final.config
+        path: |
+          devmem-final.config
+          kernelsu-commit.txt
 
     - name: Copy snd-aloop module
       if: ${{ inputs.variant == 'vTomsonek' }}
