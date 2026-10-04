@@ -1,0 +1,823 @@
+name: Build A14 6.1.112 EARLYCAPTURE
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        required: true
+        type: string
+        default: "android14"
+      kernel_version:
+        required: true
+        type: string
+        default: "6.1"
+      sub_level:
+        required: true
+        type: string
+        default: "112"
+      os_patch_level:
+        required: true
+        type: string
+        default: "2024-11"
+      variant:
+        required: false
+        type: string
+      ksu_commit:
+        required: false
+        type: string
+      build_bypass:
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build-gki:
+    name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: >-
+          ${{
+            fromJSON(
+              inputs.variant == 'vTomsonek' && '["vTomsonek"]' ||
+              inputs.variant == 'TheWildJames' && '["TheWildJames"]' ||
+              inputs.variant == 'TheWildJamesTest' && '["TheWildJamesTest"]' ||
+              inputs.variant == 'MarionKernel' && '["MarionKernel"]' ||
+              inputs.variant == 'Hakan' && '["Hakan"]' ||
+              inputs.variant == 'Duchamp' && '["Duchamp"]' ||
+              inputs.variant == 'Neyugn' && '["Neyugn"]' ||
+              (inputs.build_bypass && '["Normal","Bypass"]' || '["Normal"]')
+            )
+          }}
+
+    steps:
+    - name: Build Summary
+      run: |
+        echo "========================================"
+        echo "       Kernel Build Summary"
+        echo "========================================"
+        echo "Android Version : ${{ inputs.android_version }}"
+        echo "Kernel Version  : ${{ inputs.kernel_version }}"
+        echo "Sub Level       : ${{ inputs.sub_level }}"
+        echo "Patch Level     : ${{ inputs.os_patch_level }}"
+        echo "Build Type      : ${{ matrix.build_type }}"
+        echo "KSU Commit      : ${{ inputs.ksu_commit || 'Default' }}"
+        echo "SUSFS Enabled   : false (memory inspection build)"
+        echo "Variant         : ${{ inputs.variant || 'Standard' }}"
+        echo "========================================"
+
+    - name: Free Disk Space
+      if: true
+      uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: true
+        remove_swap: true
+        remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+        remove_packages_one_command: true
+        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+        rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
+        rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
+        testing: false
+
+    - name: Install System Dependencies
+      if: false
+      run: |
+        set -e
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          binutils \
+          binutils-x86-64-linux-gnu \
+          lld
+
+        if ! command -v ld >/dev/null 2>&1 && command -v x86_64-linux-gnu-ld >/dev/null 2>&1; then
+          sudo ln -sf "$(command -v x86_64-linux-gnu-ld)" /usr/bin/ld
+        fi
+
+        command -v ld
+        ld --version | head -n 1
+        echo "PATH=/usr/bin:/bin:$PATH" >> "$GITHUB_ENV"
+        echo "HOSTLDFLAGS=-B/usr/bin ${HOSTLDFLAGS:-}" >> "$GITHUB_ENV"
+        echo "LDFLAGS=-B/usr/bin ${LDFLAGS:-}" >> "$GITHUB_ENV"
+
+    - name: Setup Build Environment
+      run: |
+        CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}"
+        KERNEL_ROOT="$GITHUB_WORKSPACE/$CONFIG"
+        mkdir -p "$KERNEL_ROOT"
+
+        cat >> $GITHUB_ENV << EOF
+        DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig
+        DEFCONFIG_FRAGMENT=$KERNEL_ROOT/common/arch/arm64/configs/wild_gki.fragment
+        CONFIG=$CONFIG
+        KERNEL_ROOT=$KERNEL_ROOT
+        SUSFS4KSU=$GITHUB_WORKSPACE/susfs4ksu
+        KERNEL_PATCHES=$GITHUB_WORKSPACE/kernel_patches
+        ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
+        REPO=$GITHUB_WORKSPACE/git-repo/repo
+        EOF
+        
+        mkdir -p "$GITHUB_WORKSPACE/git-repo"
+        curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+        chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
+        echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+
+    - name: Clone AnyKernel3 and Other Dependencies
+      run: |
+        ANYKERNEL_BRANCH="gki-2.0"
+        git clone https://github.com/WildKernels/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+        rm -rf AnyKernel3/.git
+        git clone https://github.com/WildKernels/kernel_patches.git
+
+    - name: Initialize and Sync Kernel Source
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
+
+        repo init -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16 --depth=1
+
+        REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
+        DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
+        if grep -q deprecated <<< $REMOTE_BRANCH; then
+          sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
+        fi
+
+        repo --trace sync -c -j$(nproc --all) --fail-fast --no-tags --force-sync --no-clone-bundle
+
+    - name: Configure Kernel Options
+      if: inputs.variant == 'Duchamp'
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        rm -rf common
+        git clone --depth=1 --single-branch --branch lineage-23.0 https://github.com/mt6897-devs/android_kernel_6.1.git ./common
+
+    - name: Extract Sublevel and Set File Name
+      run: |
+        ACTUAL_SUBLEVEL="${{ inputs.sub_level }}"
+        if [[ -f "$KERNEL_ROOT/common/Makefile" ]]; then
+          EXTRACTED=$(grep '^SUBLEVEL = ' "$KERNEL_ROOT/common/Makefile" | awk '{print $3}')
+          [[ -n "$EXTRACTED" ]] && ACTUAL_SUBLEVEL="$EXTRACTED"
+        fi
+
+        ARTIFACT_BASE="${{ inputs.kernel_version }}.$ACTUAL_SUBLEVEL-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-EarlyCapture"
+        echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
+        echo "ARTIFACT_BASE=$ARTIFACT_BASE" >> $GITHUB_ENV
+        echo "FILE_NAME=$ARTIFACT_BASE" >> $GITHUB_ENV
+
+    - name: Apply glibc 2.38 Compatibility Fix
+      run: |
+        # Use ACTUAL_SUBLEVEL for LTS builds, otherwise use the input sub_level
+        if [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.10" && $ACTUAL_SUBLEVEL -le 186 ]] || 
+           [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && $ACTUAL_SUBLEVEL -le 119 ]] || 
+           [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "5.15" && $ACTUAL_SUBLEVEL -le 110 ]] || 
+           [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "6.1" && $ACTUAL_SUBLEVEL -le 43 ]]; then
+          GLIBC_VERSION=$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}') 
+          if [ "$(printf '%s\n' "2.38" "$GLIBC_VERSION" | sort -V | head -n1)" = "2.38" ]; then 
+            cd "$KERNEL_ROOT/common"
+            sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC) OUTPUT=\$(abspath \$(dir \$@))\/ \$(abspath \$@)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)" OUTPUT=$(abspath $(dir $@))\/ $(abspath $@)/' tools/bpf/resolve_btfids/Makefile 2>/dev/null || true
+            if [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.10" && $ACTUAL_SUBLEVEL -le 186 ]] || 
+               [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" && $ACTUAL_SUBLEVEL -le 119 ]] || 
+               [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "5.15" && $ACTUAL_SUBLEVEL -le 110 ]]; then
+              sed -i '/char \*buf = NULL;/a int i;' tools/lib/subcmd/parse-options.c 2>/dev/null || true
+              sed -i 's/for (int i = 0; subcommands\[i\]; i++) {/for (i = 0; subcommands[i]; i++) {/' tools/lib/subcmd/parse-options.c 2>/dev/null || true
+              sed -i '/if (subcommands) {/a int i;' tools/lib/subcmd/parse-options.c 2>/dev/null || true
+              sed -i 's/for (int i = 0; subcommands\[i\]; i++)/for (i = 0; subcommands[i]; i++)/' tools/lib/subcmd/parse-options.c 2>/dev/null || true
+            fi
+          fi
+        fi 
+
+    - name: Fix Less Than 6.6.50 Builds
+      if: inputs.android_version == 'android15' && inputs.kernel_version == '6.6'
+      working-directory: ${{ env.KERNEL_ROOT }}/common
+      run: |
+        if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c; then
+            sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace\/hooks\/fs.h>' ./fs/namespace.c
+        fi
+
+    - name: Add WKSU
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        if [[ -n "${{ inputs.ksu_commit }}" ]]; then
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s "${{ inputs.ksu_commit }}"
+        else
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s canary
+        fi
+
+    - name: Add BBG
+      if: false
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+        echo "CONFIG_BBG=y" >> "${{ env.DEFCONFIG_FRAGMENT }}"
+        sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+        if grep -q "baseband_guard" common/security/Kconfig; then
+          echo "SUCCESS: baseband_guard found in common/security/Kconfig"
+          grep -n "baseband_guard" common/security/Kconfig || true
+        else
+          echo "FAILED: baseband_guard not found in common/security/Kconfig"
+          exit 1
+        fi
+
+    - name: Apply Module Check Bypass
+      if: ${{ matrix.build_type == 'Bypass' || matrix.build_type == 'Hakan' || matrix.build_type == 'Duchamp' }}
+      run: |
+        if [[ "${{ inputs.kernel_version }}" == "6.1" || "${{ inputs.kernel_version }}" == "6.6" || "${{ inputs.kernel_version }}" == "6.12" ]]; then
+          TARGET_FILE="$KERNEL_ROOT/common/kernel/module/version.c"
+        else
+          TARGET_FILE="$KERNEL_ROOT/common/kernel/module.c"
+        fi
+
+        echo "Applying bypass to $TARGET_FILE"
+        sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' "$TARGET_FILE"
+
+        # Verify the bypass
+        if grep -A 5 "bad_version:" "$TARGET_FILE" | grep -q "return 1;"; then
+          echo "SUCCESS: Module check bypass verified in $TARGET_FILE"
+        else
+          echo "FAILED: Module check bypass not found in $TARGET_FILE"
+          grep -A 5 "bad_version:" "$TARGET_FILE" || true
+          exit 1
+        fi
+
+    - name: Fix WiFi and Bluetooth on Samsung 6.6 GKI devices
+      if: ${{ ( inputs.kernel_version == '6.6' ) }}
+      working-directory: ${{ env.KERNEL_ROOT }}/common
+      run: |
+        SYMBOL_LIST=android/abi_gki_aarch64_galaxy
+        echo "kdp_set_cred_non_rcu" >> $SYMBOL_LIST
+        echo "kdp_usecount_dec_and_test" >> $SYMBOL_LIST
+        echo "kdp_usecount_inc" >> $SYMBOL_LIST
+
+        PATCH="$KERNEL_PATCHES/samsung/min_kdp/add-min_kdp-symbols.patch"
+        if patch -p1 --dry-run < "$PATCH"; then
+          patch -p1 --no-backup-if-mismatch < $PATCH
+        fi
+
+        cp "$KERNEL_PATCHES/samsung/min_kdp/min_kdp.c" drivers/min_kdp.c
+        echo "obj-y += min_kdp.o" >> drivers/Makefile
+
+    - name: Fix WiFi and Bluetooth on Xiaomi 6.6 GKI devices
+      if: ${{ ( inputs.kernel_version == '6.6' ) }}
+      working-directory: ${{ env.KERNEL_ROOT }}/common
+      run: |
+        SYMBOL_LIST=android/abi_gki_aarch64_xiaomi
+        echo "device_find_any_child" >> $SYMBOL_LIST
+
+    - name: Configure Kernel Options
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        cat >> "${{ env.DEFCONFIG_FRAGMENT }}" << 'EOF'
+        CONFIG_DEVMEM=y
+        # CONFIG_STRICT_DEVMEM is not set
+        # CONFIG_IO_STRICT_DEVMEM is not set
+        CONFIG_IKCONFIG=y
+        CONFIG_IKCONFIG_PROC=y
+        # KernelSU Configuration
+        CONFIG_KSU=y
+        # CONFIG_KSU_SUSFS is not set
+
+        # KPatch Next Support
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+
+        # Mountify Support
+        CONFIG_TMPFS_XATTR=y
+        CONFIG_TMPFS_POSIX_ACL=y
+        
+        EOF
+
+        # Networking Configuration
+        #CONFIG_IP_NF_TARGET_TTL=y
+        #CONFIG_IP6_NF_TARGET_HL=y
+        #CONFIG_IP6_NF_MATCH_HL=y
+        
+        # BBR TCP Congestion Control
+        #CONFIG_TCP_CONG_ADVANCED=y
+        #CONFIG_TCP_CONG_BBR=y
+        #CONFIG_NET_SCH_FQ=y
+        ## CONFIG_TCP_CONG_BIC is not set
+        ## CONFIG_TCP_CONG_WESTWOOD is not set
+        ## CONFIG_TCP_CONG_HTCP is not set
+        
+        # IPSet Support
+        #CONFIG_IP_SET=y
+        #CONFIG_IP_SET_MAX=65534
+        #CONFIG_IP_SET_BITMAP_IP=y
+        #CONFIG_IP_SET_BITMAP_IPMAC=y
+        #CONFIG_IP_SET_BITMAP_PORT=y
+        #CONFIG_IP_SET_HASH_IP=y
+        #CONFIG_IP_SET_HASH_IPMARK=y
+        #CONFIG_IP_SET_HASH_IPPORT=y
+        #CONFIG_IP_SET_HASH_IPPORTIP=y
+        #CONFIG_IP_SET_HASH_IPPORTNET=y
+        #CONFIG_IP_SET_HASH_IPMAC=y
+        #CONFIG_IP_SET_HASH_MAC=y
+        #CONFIG_IP_SET_HASH_NETPORTNET=y
+        #CONFIG_IP_SET_HASH_NET=y
+        #CONFIG_IP_SET_HASH_NETNET=y
+        #CONFIG_IP_SET_HASH_NETPORT=y
+        #CONFIG_IP_SET_HASH_NETIFACE=y
+        #CONFIG_IP_SET_LIST_SET=y
+        
+        echo "Contents of ${{ env.DEFCONFIG_FRAGMENT }}:"
+        cat "${{ env.DEFCONFIG_FRAGMENT }}"
+
+    - name: Configure Audio Modules
+      if: inputs.variant == 'Hakan'
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        cat >> "${{ env.DEFCONFIG_FRAGMENT }}" << 'EOF'
+        CONFIG_RFKILL=y
+        CONFIG_CFG80211=y
+        CONFIG_MAC80211=y
+        EOF
+
+        sed -i \
+          -e '/_COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*"lib\/crypto\/libarc4\.ko",[[:space:]]*$/d}' \
+          -e '/_COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*"net\/rfkill\/rfkill\.ko",[[:space:]]*$/d}' \
+          common/modules.bzl
+
+    - name: Configure SND
+      if: inputs.variant == 'vTomsonek'
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        cat >> "${{ env.DEFCONFIG_FRAGMENT }}" << 'EOF'
+        # Sound Configuration
+        CONFIG_SND=y
+        CONFIG_SND_DRIVERS=y
+        CONFIG_SND_PCM=y
+        CONFIG_SND_TIMER=y
+        CONFIG_SND_DYNAMIC_MINORS=y
+        CONFIG_SND_PROC_FS=y
+        CONFIG_SND_ALOOP=m
+        CONFIG_USB_GADGET=y
+        CONFIG_CONFIGFS_FS=y
+        CONFIG_USB_CONFIGFS=y
+        CONFIG_USB_LIBCOMPOSITE=m
+        CONFIG_USB_AUDIO=m
+        CONFIG_USB_CONFIGFS_F_UAC1=y
+        CONFIG_USB_CONFIGFS_F_UAC2=y
+        EOF
+
+        # Add snd-aloop.ko to modules list
+        echo "drivers/usb/gadget/legacy/g_audio.ko" >> common/android/gki_aarch64_modules
+        echo "sound/drivers/snd-aloop.ko" >> common/android/gki_aarch64_modules
+        #echo "drivers/usb/gadget/libcomposite.ko" >> common/android/gki_aarch64_modules
+
+        if [[ -f common/modules.bzl ]]; then
+          # Insert before the closing bracket of COMMON_GKI_MODULES_LIST or _COMMON_GKI_MODULES_LIST
+          echo "Audio modules injection: adding to module list"
+          if [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "5.15" && $ACTUAL_SUBLEVEL -le 110 && "${{ inputs.os_patch_level }}" != "2023-09" ]] \
+          || [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "6.1" && $ACTUAL_SUBLEVEL -le 25 && "${{ inputs.os_patch_level }}" != "2023-09" ]]; then
+            # snd-aloop
+            sed -i '/COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "sound/drivers/snd-aloop.ko",
+            }' common/modules.bzl
+            # USB Gadget Audio modules
+            sed -i '/COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "drivers/usb/gadget/libcomposite.ko",
+            }' common/modules.bzl
+            sed -i '/COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "drivers/usb/gadget/legacy/g_audio.ko",
+            }' common/modules.bzl
+          else
+            # snd-aloop
+            sed -i '/_COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "sound/drivers/snd-aloop.ko",
+            }' common/modules.bzl
+            # USB Gadget Audio modules
+            sed -i '/_COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "drivers/usb/gadget/libcomposite.ko",
+            }' common/modules.bzl
+            sed -i '/_COMMON_GKI_MODULES_LIST = \[/,/^[[:space:]]*\]/{/^[[:space:]]*\]$/i\    "drivers/usb/gadget/legacy/g_audio.ko",
+            }' common/modules.bzl
+          fi
+          
+          # Verify the injection was successful
+          if grep -q '"sound/drivers/snd-aloop.ko"' common/modules.bzl && \
+            grep -q '"drivers/usb/gadget/libcomposite.ko"' common/modules.bzl && \
+            grep -q '"drivers/usb/gadget/legacy/g_audio.ko"' common/modules.bzl && \
+            grep -q '"drivers/usb/gadget/configfs.ko"' common/modules.bzl; then
+            echo "✓ Audio modules injection: successfully added all modules to list"
+          else
+            echo "✗ Audio modules injection: failed to add one or more modules"
+            exit 1
+          fi
+        fi
+
+        # Add symbols to abi_gki_aarch64
+        #SYMBOL_LIST=common/android/abi_gki_aarch64
+        #cat Wild_KSU/kernel/export_symbol.txt | awk '{sub("[ \t]+","");print "  "$0}' >> $SYMBOL_LIST
+
+        # ABI compare bypass per kernel/android version
+        # Edit each block as needed per version
+        if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
+          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/abi/compare_to_symbol_list
+        elif [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
+          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/kernel/abi/compare_to_symbol_list
+        elif [[ "${{ inputs.android_version }}" == "android13" && "${{ inputs.kernel_version }}" == "5.15" ]]; then
+          sed -i 's/^\s*exit 1$/    echo "Who Cares? Bypassing Now!"/' build/kernel/abi/compare_to_symbol_list
+        elif [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "5.15" ]]; then
+          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
+        elif [[ "${{ inputs.android_version }}" == "android14" && "${{ inputs.kernel_version }}" == "6.1" ]]; then
+          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
+        elif [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; then
+          perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
+        fi
+
+    - name: Append ashmem exports if missing
+      if: ${{ inputs.android_version == 'android16' && inputs.kernel_version == '6.12' && false }}
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        FILE=common/drivers/staging/android/ashmem.c
+        if [[ -f "$FILE" ]] && ! grep -q 'is_ashmem_file' "$FILE"; then
+        cat >>"$FILE" <<'EOF'
+        bool is_ashmem_file(struct file *file) { return false; }
+        int ashmem_area_name(struct file *file, char *name) { return 0; }
+        long ashmem_area_size(struct file *file) { return 0; }
+        struct file *ashmem_area_vmfile(struct file *file) { return NULL; }
+        EXPORT_SYMBOL_GPL(is_ashmem_file);
+        EXPORT_SYMBOL_GPL(ashmem_area_name);
+        EXPORT_SYMBOL_GPL(ashmem_area_size);
+        EXPORT_SYMBOL_GPL(ashmem_area_vmfile);
+        EOF
+        fi
+
+        if [ -f common/drivers/android/binder/Makefile ]; then
+          perl -i -0777 -pe 's/\$\(\s*CONFIG_ANDROID_BINDER_IPC_RUST\s*\)/m/' common/drivers/android/binder/Makefile
+          #perl -i -ne 'print unless /CONFIG_ANDROID_BINDER_IPC_RUST_DUMMY/' common/drivers/android/binder/Makefile
+          perl -i -pe 's/^rust_binder-\$\([^)]+\)\s*:=/rust_binder-y :=/' common/drivers/android/binder/Makefile
+          cat common/drivers/android/Makefile
+          cat common/drivers/android/binder/Makefile
+          #perl -ni -e 'print unless /rust_toolchain\s*=\s*"\/\/build\/rust:linux_kernel_toolchain",/' common/BUILD.bazel
+          #cat common/BUILD.bazel
+          rustup set profile minimal
+          rustup update nightly
+          rustup default nightly
+          rustup target add aarch64-unknown-none
+        else
+          perl -i -0777 -pe 's/\$\(\s*CONFIG_ANDROID_BINDER_IPC_RUST\s*\)/m/' common/drivers/android/Makefile
+          cat common/drivers/android/Makefile
+        fi
+
+    - name: Install early DeviceInfo capture
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        set -eu
+        cat > /tmp/abl_early_capture.h <<'ABL_CAPTURE_HEADER'
+        /* SPDX-License-Identifier: GPL-2.0 */
+        /* TB321FU diagnostic: candidates only, never writes to firmware memory. */
+        #include <linux/init.h>
+        #include <linux/memblock.h>
+        #include <linux/proc_fs.h>
+        #include <linux/seq_file.h>
+        #include <linux/string.h>
+        #include <linux/uaccess.h>
+        #include <asm/memory.h>
+        #include <asm/sections.h>
+        #include <asm/unaligned.h>
+        
+        #define ABL_CAPTURE_SIZE 0xea8
+        #define ABL_CAPTURE_MAX 16
+        #define ABL_CAPTURE_START ((phys_addr_t)0xa2400000ULL)
+        #define ABL_CAPTURE_END ((phys_addr_t)0xd3a00000ULL)
+        
+        struct abl_capture_record {
+        	phys_addr_t address;
+        	u8 bytes[ABL_CAPTURE_SIZE];
+        };
+        static struct abl_capture_record abl_records[ABL_CAPTURE_MAX];
+        static unsigned int abl_record_count;
+        static unsigned long abl_pages_read, abl_pages_failed, abl_pages_skipped;
+        static unsigned long abl_magic_hits, abl_snapshot_failed;
+        static bool abl_capture_ran;
+        static u8 abl_scan_buffer[PAGE_SIZE + 12] __initdata __aligned(8);
+        static const u8 abl_magic[] __initconst = "ANDROID-BOOT!";
+        
+        static int __init __no_sanitize_address
+        abl_copy_snapshot(phys_addr_t start, u8 *dst)
+        {
+        	phys_addr_t p;
+        	for (p = start & PAGE_MASK; p < start + ABL_CAPTURE_SIZE; p += PAGE_SIZE)
+        		if (!memblock_is_map_memory(p))
+        			return -EFAULT;
+        	return copy_from_kernel_nofault(dst, __va(start), ABL_CAPTURE_SIZE);
+        }
+        
+        static void __init __no_sanitize_address
+        abl_capture_candidate(phys_addr_t address)
+        {
+        	unsigned int i;
+        	phys_addr_t kernel_start = __pa_symbol(_text);
+        	phys_addr_t kernel_end = __pa_symbol(_end);
+        
+        	/* Require the complete snapshot to stay inside the scanned RAM window. */
+        	if (address < ABL_CAPTURE_START ||
+        	    address > ABL_CAPTURE_END - ABL_CAPTURE_SIZE)
+        		return;
+        	if (address < kernel_end && address + ABL_CAPTURE_SIZE > kernel_start)
+        		return;
+        	for (i = 0; i < abl_record_count; i++)
+        		if (abl_records[i].address == address)
+        			return;
+        	abl_magic_hits++;
+        	if (abl_record_count >= ABL_CAPTURE_MAX)
+        		return;
+        	if (abl_copy_snapshot(address, abl_records[abl_record_count].bytes)) {
+        		abl_snapshot_failed++;
+        		return;
+        	}
+        	abl_records[abl_record_count].address = address;
+        	abl_record_count++;
+        }
+        
+        /* Called immediately after paging_init(), before bootmem_init(). */
+        static void __init __no_sanitize_address abl_early_capture(void)
+        {
+        	struct memblock_region *region;
+        	phys_addr_t p, begin, end, previous_end = 0;
+        	phys_addr_t kernel_start = __pa_symbol(_text) & PAGE_MASK;
+        	phys_addr_t kernel_end = PAGE_ALIGN(__pa_symbol(_end));
+        	size_t carry = 0, i, length;
+        
+        	abl_capture_ran = true;
+        	for_each_mem_region(region) {
+        		if (memblock_is_nomap(region))
+        			continue;
+        		begin = max_t(phys_addr_t, region->base, ABL_CAPTURE_START);
+        		end = min_t(phys_addr_t, region->base + region->size, ABL_CAPTURE_END);
+        		begin = PAGE_ALIGN(begin);
+        		end &= PAGE_MASK;
+        		for (p = begin; p < end; p += PAGE_SIZE) {
+        			if (p != previous_end)
+        				carry = 0;
+        			if (p >= kernel_start && p < kernel_end) {
+        				abl_pages_skipped++;
+        				carry = 0;
+        				previous_end = 0;
+        				continue;
+        			}
+        			if (copy_from_kernel_nofault(abl_scan_buffer + carry,
+        						   __va(p), PAGE_SIZE)) {
+        				abl_pages_failed++;
+        				carry = 0;
+        				previous_end = 0;
+        				continue;
+        			}
+        			abl_pages_read++;
+        			length = PAGE_SIZE + carry;
+        			for (i = 0; i + sizeof(abl_magic) - 1 <= length; i++) {
+        				if (abl_scan_buffer[i] == abl_magic[0] &&
+        				    !memcmp(abl_scan_buffer + i, abl_magic,
+        					    sizeof(abl_magic) - 1))
+        					abl_capture_candidate(p - carry + i);
+        			}
+        			memmove(abl_scan_buffer, abl_scan_buffer + length - 12, 12);
+        			carry = 12;
+        			previous_end = p + PAGE_SIZE;
+        		}
+        	}
+        	pr_info("ABL_CAPTURE: pages=%lu faults=%lu candidates=%u magic_hits=%lu\n",
+        		abl_pages_read, abl_pages_failed, abl_record_count, abl_magic_hits);
+        }
+        
+        static int abl_capture_show(struct seq_file *m, void *unused)
+        {
+        	unsigned int r, i;
+        	seq_puts(m, "ABL_CAPTURE v1; candidates only, not authenticated rollback values\n");
+        	seq_printf(m, "ran=%u window=0xa2400000-0xd39fffff page_size=%lu\n",
+        		abl_capture_ran, (unsigned long)PAGE_SIZE);
+        	seq_printf(m, "read_pages=%lu fault_pages=%lu kernel_pages_skipped=%lu\n",
+        		abl_pages_read, abl_pages_failed, abl_pages_skipped);
+        	seq_printf(m, "magic_hits=%lu snapshot_failures=%lu saved=%u limit=%u\n",
+        		abl_magic_hits, abl_snapshot_failed, abl_record_count, ABL_CAPTURE_MAX);
+        	for (r = 0; r < abl_record_count; r++) {
+        		seq_printf(m, "candidate=%u physical=0x%llx size=0x%x\n", r,
+        			(unsigned long long)abl_records[r].address, ABL_CAPTURE_SIZE);
+        		seq_puts(m, "raw_snapshot_hex:\n");
+        		for (i = 0; i < ABL_CAPTURE_SIZE; i += 32)
+        			seq_printf(m, "%04x %*phN\n", i,
+        				min_t(unsigned int, 32, ABL_CAPTURE_SIZE - i),
+        				abl_records[r].bytes + i);
+        		seq_puts(m, "candidate_rollback_u64_le (offset 0x898):\n");
+        		for (i = 0; i < 32; i++)
+        			seq_printf(m, "%02u 0x%016llx\n", i,
+        				(unsigned long long)get_unaligned_le64(
+        					abl_records[r].bytes + 0x898 + 8 * i));
+        	}
+        	return 0;
+        }
+        
+        static int abl_capture_open(struct inode *inode, struct file *file)
+        {
+        	return single_open(file, abl_capture_show, NULL);
+        }
+        
+        static const struct proc_ops abl_capture_proc_ops = {
+        	.proc_open = abl_capture_open,
+        	.proc_read = seq_read,
+        	.proc_lseek = seq_lseek,
+        	.proc_release = single_release,
+        };
+        
+        static int __init abl_capture_proc_init(void)
+        {
+        	if (!proc_create("abl_early_capture", 0400, NULL, &abl_capture_proc_ops))
+        		return -ENOMEM;
+        	return 0;
+        }
+        late_initcall(abl_capture_proc_init);
+        ABL_CAPTURE_HEADER
+        cat > /tmp/install_early_capture.py <<'ABL_CAPTURE_INSTALLER'
+        #!/usr/bin/env python3
+        """Apply a narrowly checked hook to ARM64 setup.c; no source downloads."""
+        import pathlib
+        import sys
+        
+        root = pathlib.Path(sys.argv[1])
+        header = pathlib.Path(sys.argv[2])
+        target = root / "arch/arm64/kernel/setup.c"
+        text = target.read_text()
+        anchor = "static int num_standard_resources;"
+        hook = "\tpaging_init();"
+        if "abl_early_capture" in text:
+            raise SystemExit("Early capture already installed; refusing a duplicate hook")
+        if text.count(anchor) != 1 or text.count(hook) != 1:
+            raise SystemExit("Unexpected setup.c layout; refusing to guess hook placement")
+        if text.index(hook) >= text.index("\tbootmem_init();"):
+            raise SystemExit("Unexpected bootmem_init ordering")
+        text = text.replace(anchor, '#include "abl_early_capture.h"\n\n' + anchor)
+        text = text.replace(hook, hook + "\n\n\tabl_early_capture();")
+        (target.parent / "abl_early_capture.h").write_bytes(header.read_bytes())
+        target.write_text(text)
+        print("Installed capture after paging_init(), before bootmem_init()")
+        ABL_CAPTURE_INSTALLER
+        python3 /tmp/install_early_capture.py "$KERNEL_ROOT/common" /tmp/abl_early_capture.h
+        sha256sum common/arch/arm64/kernel/abl_early_capture.h
+
+    - name: Change Kernel Name
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        #Wild to Kernel Version (replace last instance only)
+        if [[ "${{ inputs.kernel_version }}" == "5."* ]] || [[ "${{ inputs.kernel_version }}" == "6.1" ]]; then
+          case ${{ matrix.build_type }} in
+            TheWildJames)
+              perl -i -0777 -pe 's/(.*)echo "\$res"/$1echo "\$res-🟢-Wild-Exclusive"/s' ./common/scripts/setlocalversion
+              ;;
+            MarionKernel)
+              perl -i -0777 -pe 's/(.*)echo "\$res"/$1echo "\$res-Wild-MarionKernel"/s' ./common/scripts/setlocalversion
+              ;;
+            Hakan)
+              perl -i -0777 -pe 's/(.*)echo "\$res"/$1echo "\$res-Wild-Hakan"/s' ./common/scripts/setlocalversion
+              ;;
+            *)
+              perl -i -0777 -pe 's/(.*)echo "\$res"/$1echo "\$res-Wild"/s' ./common/scripts/setlocalversion
+              ;;
+          esac
+        else
+          perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\${KERNELVERSION}\${file_localversion}\${config_localversion}\${LOCALVERSION}-Wild\${scm_version}"/s' ./common/scripts/setlocalversion
+        fi
+        export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+        if [ -f "build/build.sh" ]; then
+          #Remove Dirty Flag
+          sed -i 's/-dirty//' ./common/scripts/setlocalversion
+        else
+          #Remove Dirty Flag
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+          sed -i 's/-dirty//' ./common/scripts/setlocalversion
+          #Remove Abi Exports and Error
+          rm -rf ./common/android/abi_gki_protected_exports_*
+          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' ./common/BUILD.bazel
+        fi
+
+        cd $KERNEL_ROOT/common
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add .
+        git commit -m "Wild: Clean Dirty Flag"
+
+    - name: Build Kernel
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        set -ex
+        #make -C common mrproper
+        if [ -f "build/build.sh" ]; then
+          GKI_DEFCONFIG_FRAGMENT="${{ env.DEFCONFIG_FRAGMENT }}" LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh || exit 1
+        else
+          if [[ "${{ inputs.android_version }}" == "android14" ]]; then
+            tools/bazel build --config=fast --lto=thin --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment //common:kernel_aarch64_dist || exit 1
+          else
+            tools/bazel build --config=fast --lto=none --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment //common:kernel_aarch64_dist || exit 1
+          fi
+        fi
+
+    - name: Prepare AnyKernel3 Zip
+      run: |
+        # Copy Image from normal build locations
+        if [ -f "$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" ]; then
+          cp "$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" "$ANYKERNEL3/Image"
+        elif [ -f "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/Image" ]; then
+          cp "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/Image" "$ANYKERNEL3/Image"
+        else
+          echo "Error: Image file not found in any expected location"
+          exit 1
+        fi
+    
+    - name: Verify DEVMEM settings in built Image
+      run: |
+        set -eu
+        bash "$KERNEL_ROOT/common/scripts/extract-ikconfig" "$ANYKERNEL3/Image" > "$GITHUB_WORKSPACE/devmem-final.config"
+        grep -qx 'CONFIG_DEVMEM=y' "$GITHUB_WORKSPACE/devmem-final.config"
+        if grep -qx 'CONFIG_KSU_SUSFS=y' "$GITHUB_WORKSPACE/devmem-final.config"; then
+          echo "SUSFS is unexpectedly enabled"
+          exit 1
+        fi
+        grep -qx '# CONFIG_STRICT_DEVMEM is not set' "$GITHUB_WORKSPACE/devmem-final.config"
+        if grep -qx 'CONFIG_IO_STRICT_DEVMEM=y' "$GITHUB_WORKSPACE/devmem-final.config"; then
+          echo "IO_STRICT_DEVMEM is unexpectedly enabled"
+          exit 1
+        fi
+        grep -E 'CONFIG_(DEVMEM|STRICT_DEVMEM|IO_STRICT_DEVMEM)' "$GITHUB_WORKSPACE/devmem-final.config"
+
+    - name: Upload early capture source
+      uses: actions/upload-artifact@v4
+      with:
+        name: earlycapture-source
+        path: |
+          ${{ env.KERNEL_ROOT }}/common/arch/arm64/kernel/abl_early_capture.h
+          ${{ env.KERNEL_ROOT }}/common/arch/arm64/kernel/setup.c
+
+    - name: Upload verified kernel configuration
+      uses: actions/upload-artifact@v4
+      with:
+        name: devmem-config-${{ matrix.build_type }}
+        path: devmem-final.config
+
+    - name: Copy snd-aloop module
+      if: ${{ inputs.variant == 'vTomsonek' }}
+      run: |
+        if [ "${{ inputs.variant }}" = "vTomsonek" ]; then
+          sed -i 's|^do\.modules=.*|do.modules=1|' ./AnyKernel3/anykernel.sh
+        fi
+
+        mkdir -p AnyKernel3/modules/data/adb/lkm
+
+        if [[ "${{ inputs.android_version }}" == "android12" || "${{ inputs.android_version }}" == "android13" ]]; then
+          SRC_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
+        else
+          SRC_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+        fi
+
+        cp "$SRC_DIR/snd-aloop.ko" "$ANYKERNEL3/modules/data/adb/lkm/"
+        cp "$SRC_DIR/g_audio.ko" "$ANYKERNEL3/modules/data/adb/lkm/"
+
+    - name: Scan and collect patch rejects
+      if: ${{ always() }}
+      run: |
+        set -e
+        CONFIG_DIR="$KERNEL_ROOT"
+        REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
+        mkdir -p "$REJECTS_DIR"
+        # Find all .rej files under the configuration directory
+        mapfile -t REJS < <(find "$CONFIG_DIR" -type f -name '*.rej')
+        REJ_COUNT=${#REJS[@]}
+        echo "Found $REJ_COUNT .rej files under $CONFIG_DIR"
+        echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
+        if [ "$REJ_COUNT" -gt 0 ]; then
+          for REJ in "${REJS[@]}"; do
+            # Relative path from $CONFIG
+            REL="${REJ#"$CONFIG_DIR"/}"
+            DEST="$REJECTS_DIR/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            cp "$REJ" "$DEST"
+            # Copy the associated original file alongside the .rej
+            ORIG="${REJ%.rej}"
+            if [ -f "$ORIG" ]; then
+              ORIG_DEST="$REJECTS_DIR/${REL%.rej}"
+              mkdir -p "$(dirname "$ORIG_DEST")"
+              cp "$ORIG" "$ORIG_DEST"
+            fi
+            echo "$REL" >> "$REJECTS_DIR/index.txt"
+          done
+        fi
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.FILE_NAME }}-AnyKernel3
+        path: ./AnyKernel3/**
+        if-no-files-found: ignore
+        compression-level: 9
+
+    - name: Upload Rejects
+      if: ${{ always() && matrix.build_type != 'Bypass' && env.REJ_COUNT > 0 }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.FILE_NAME }}-Rejects
+        path: patch-rejects/
+        if-no-files-found: ignore
+        compression-level: 9
+
+# End of workflow
