@@ -49,6 +49,14 @@ cp Image kernel
 
 今回の Gen3 では unlocked 状態で `fastboot boot` による一時起動を確認しました。Gen2 は `fastboot boot` が `unknown command` となったため、診断用 boot を対象スロットへ書き込んでテストしています。端末のスロットと元の boot を確認してから扱ってください。診断カーネルの導入・復元は解析ツールの機能には含まれません。
 
+## KernelSU Manager
+
+Gen2・Gen3 の診断用カーネルでは、管理アプリに **KernelSU_Next_v3.0.0_32857-release.apk** を使用してください。
+
+[KernelSU Manager をダウンロード](https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.0.0/KernelSU_Next_v3.0.0_32857-release.apk)
+
+インストール後、EarlyCapture ログを取得する際は adb shell の root 権限を許可してください。
+
 ## EarlyCapture ログの取得
 
 診断カーネルで起動し、KernelSU の管理アプリで adb shell の root を許可した後、**Windows のコマンドプロンプト**で実行します。
