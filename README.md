@@ -8,7 +8,7 @@
 
 | 端末 | ROM | 診断用カーネル | 実機確認 |
 |---|---|---|---|
-| Legion Y700 Gen2 / TB320FC | ZUX OS 1.1.350 | Android12 / 5.10.209 / Wild KernelSU | 起動・root・DeviceInfo取得・非ゼロのrollbackindex照合 |
+| Legion Y700 Gen2 / TB320FC | ZUI 17.0.478 | Android12 / 5.10.233 / Wild KernelSU | 起動・root・DeviceInfo取得・非ゼロのrollbackindex照合 |
 | Legion Y700 Gen3 / TB321FU | ZUX 1.5.10.184 | Android14 / 6.1.112 / Wild KernelSU | 起動・root・DeviceInfo取得・fastboot表示との32個の値の照合 |
 
 上記はテストに使用した構成です。カーネル系列の Android12 / Android14 は、端末の現在の OS 表示そのものを表すものではありません。他の ROM・端末での互換性は未確認です。
@@ -17,7 +17,7 @@
 
 | 対象 | GitHub Actions の名前 | ワークフローファイル |
 |---|---|---|
-| Gen2 | `Build Gen2 A12 5.10.209 EARLYCAPTURE KSU` | `.github/workflows/build-gen2-a12-510209-earlycapture.yml` |
+| Gen2 | `Build Gen2 A12 5.10.233 EARLYCAPTURE KSU` | `.github/workflows/build-gen2-a12-510233-earlycapture.yml` |
 | Gen3 | `Build A14 6.1.112 EARLYCAPTURE` | `.github/workflows/build-a14-6112-earlycapture.yml` |
 
 診断用構成では Wild KernelSU と `/dev/mem` を有効化し、SUSFS と STRICT_DEVMEM を無効化します。EarlyCapture の出力先は `/proc/abl_early_capture` です。Gen2 の DXEv2 は DXE Heap を含む検索範囲へ拡張しています。
