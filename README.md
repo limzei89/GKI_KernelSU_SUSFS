@@ -103,7 +103,7 @@ start.cmd "D:\ROM\image\abl.elf" "D:\capture\abl_early_capture.txt" "D:\analysis
 Python から直接実行することもできます。
 
 ```cmd
-py -3 rollback_tool.py "D:\ROM\image\abl.elf" --capture "D:\capture\abl_early_capture.txt" --out "D:\analysis\deviceinfo"
+python rollback_tool.py "D:\ROM\image\abl.elf" --capture "D:\capture\abl_early_capture.txt" --out "D:\analysis\deviceinfo"
 ```
 
 ### 出力ファイル
