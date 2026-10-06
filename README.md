@@ -80,7 +80,7 @@ adb exec-out su -c "cat /proc/abl_early_capture" > abl_early_capture.txt
 - Windows の `powershell.exe` と Windows Forms。通常の Windows 10 / 11 では標準環境で利用できます。
 - 対象 ROM の `abl.elf` と、同じ端末・ROM の EarlyCapture ログ。
 
-Codex は不要です。`start.cmd` は `py -3`、`python`、`python3` の順で、実行可能な Python を探します。WindowsApps 経由の Python も実行確認して使用します。
+`start.cmd` は `py -3`、`python`、`python3` の順で、実行可能な Python を探します。WindowsApps 経由の Python も実行確認して使用します。
 
 ### ファイル選択で実行
 
